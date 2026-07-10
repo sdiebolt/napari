@@ -12,3 +12,9 @@ class _LabelsSliceRequest(_ScalarFieldSliceRequest):
     ) -> npt.NDArray:
         """Project a thick slice along axis based on mode."""
         raise NotImplementedError
+
+    @staticmethod
+    def _resample_order() -> int:
+        # Nearest-neighbor: linear interpolation between label IDs would
+        # invent labels that were never in the data.
+        return 0

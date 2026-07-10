@@ -68,13 +68,38 @@ only gates *whether we take this path*, not the math itself.
 4. extract:   data_at_data_level[bbox_slices]                -- plain numpy/dask/zarr slice, unchanged
 5. resample:  scipy.ndimage.map_coordinates(chunk, coords)   -- generic, any affine
               coords built from (A, b) over the canvas grid, shifted into chunk-local frame
-6. tile_to_data: identity/translate only                     -- rotation already baked in by step 5
+6. tile_to_data: derived from the same (A, b), see below              -- no vispy code changes needed
 ```
 
-Step 6 matters: `map_coordinates` is evaluated *at* the canvas sample
-locations, so the output is already registered 1:1 to canvas pixels.
-`tile_to_data` (consumed by vispy at `scalar_field.py:1000`) collapses to a
-plain translate — no vispy-side changes needed.
+**Step 6, corrected from an earlier draft of this doc:** `tile_to_data`
+does *not* simply collapse to identity/translate — the renderer composes
+`data_to_world ∘ tile_to_data` and only then restricts to the displayed
+axes (`Affine.set_slice`, see `_vispy/layers/base.py:206`), so a naive
+translate-only `tile_to_data` would let `data_to_world` re-apply the
+rotation on top of an already-derotated image. What actually works,
+reusing the exact same `plane` object from step 2 with no new math:
+
+```python
+linear_matrix = np.eye(ndim)
+linear_matrix[:, displayed] = plane.matrix * world_step
+translate = plane(world_origin)
+```
+
+Because `set_slice` only reads the displayed×displayed block of the
+*composed* transform, and `D[displayed, :] @ D⁻¹[:, displayed] = I`
+(where `D = data_to_world.linear_matrix`), this composition's displayed
+block reduces to exactly `diag(world_step)` — the rotation cancels out
+algebraically, it isn't just "not there". Implemented as
+`oblique_tile_to_data` in `_scalar_field/_oblique_slice.py`.
+
+Known follow-up nuance (not correctness-blocking): the existing
+half-pixel pixel-center offset in `_on_matrix_change`
+(`_vispy/layers/base.py:262-275`) computes its shift from
+`data_to_world.set_slice(displayed).linear_matrix`, which assumes tile
+pixel == data pixel. For an oblique tile that assumption doesn't hold
+(tile pixel spacing is `world_step`, not a data axis's pitch), so the
+half-pixel centering is likely slightly off for oblique tiles. Data
+placement itself is correct; this only affects sub-pixel centering.
 
 ## Where each piece lives
 
@@ -110,19 +135,44 @@ rewrite.
 ## Staged plan
 
 1. **Math only.** `is_solid` / `_PlaneSlice` / `slice_plane` + unit tests.
-   No behavior change to the existing slicing pipeline yet.
-2. Single-scale Image, `projection_mode='none'`: wire `_call_oblique_slice`
-   + bbox/resample module.
-3. Labels (order=0 hook).
-4. Multiscale (pinned level, no smart picking).
-5. Thick-slice / projection-mode interaction.
+   No behavior change to the existing slicing pipeline yet. **Done.**
+2. Single-scale Image + Labels: wire `_call_oblique_slice` + bbox/resample
+   module + `tile_to_data` derivation + Labels order=0 hook. (Labels rode
+   along with this step since it was a one-line override once the
+   `_project_slice`-style hook pattern was in place.) **Done.**
+3. Multiscale (pinned level, no smart picking).
+4. Thick-slice / projection-mode interaction.
 
 Steps 1–2 are the feasibility proof (~1–2 wk). 3–5 are incremental,
 lower-risk given the seam above.
 
 ---
 
-**Status:** Step 1 done — `is_solid`, `_PlaneSlice`, `slice_plane` added to
-`layers/utils/_slice_input.py`, with tests in
-`layers/utils/_tests/test_slice_input.py`. Not yet wired into the slicing
-pipeline (`_ScalarFieldSliceRequest`) — that's step 2.
+**Status:** Steps 1 and 2 done.
+
+- Step 1: `is_solid`, `_PlaneSlice`, `slice_plane` in
+  `layers/utils/_slice_input.py`, tests in
+  `layers/utils/_tests/test_slice_input.py`.
+- Step 2: new `_scalar_field/_oblique_slice.py` (canvas grid, bbox,
+  `map_coordinates` resample, `tile_to_data` derivation) wired into
+  `_ScalarFieldSliceRequest.__call__` (`_call_oblique_slice`) and
+  `ScalarFieldSlicingState._resolve_slice_geometry`/`_oblique_canvas_grid`
+  (`scalar_field.py`), gated to single-scale layers only. Labels gets a
+  nearest-neighbor (`order=0`) override in `labels/_slice.py`. Tests in
+  `layers/image/_tests/test_oblique_slice.py` verify actual pixel values
+  against a closed-form trig ground truth (not just that code runs),
+  including a case unaffected by rotation and one affected by it, plus
+  regression coverage that shear and multiscale still fall back to the
+  old warn-and-drop behavior. Full `layers/` suite (2067 tests) passes
+  with no regressions.
+
+Verified: the vispy node transform for a rotated 2D image comes back
+well-formed (identity linear block, finite translate) rather than
+degenerate — consistent with the `tile_to_data` derivation above.
+Could not get an actual on-screen screenshot in this sandbox (a control
+test with an ordinary unrotated image also renders blank here, so this
+is a headless-environment limitation, not specific to this change) — a
+real-display check is still worth doing before calling this done.
+
+Next: step 3 (Labels order=0 hook — technically already done above,
+piggybacked onto step 2), then step 4 (multiscale).

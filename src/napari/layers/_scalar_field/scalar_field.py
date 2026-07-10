@@ -11,6 +11,7 @@ from numpy import typing as npt
 
 from napari.layers._data_protocols import LayerDataProtocol
 from napari.layers._multiscale_data import MultiScaleData
+from napari.layers._scalar_field._oblique_slice import ObliqueCanvasGrid
 from napari.layers._scalar_field._slice import (
     _ScalarFieldSliceRequest,
     _ScalarFieldSliceResponse,
@@ -23,11 +24,14 @@ from napari.layers.image._image_mouse_bindings import (
 )
 from napari.layers.image._image_utils import guess_multiscale
 from napari.layers.utils._slice_input import (
+    _PlaneSlice,
     _SliceInput,
     _ThickNDSlice,
+    apply_units_to_transform,
 )
 from napari.layers.utils.layer_utils import (
     compute_multiscale_level_and_corners,
+    get_extent_world,
 )
 from napari.layers.utils.plane import SlicingPlane
 from napari.types import LayerDataType
@@ -880,10 +884,14 @@ class ScalarFieldSlicingState(_LayerSlicingState):
             corners[1, displayed] = shape - 1
             self.layer._data_level = level
             self.layer.corner_pixels = corners
+        data_slice, canvas_grid = self._resolve_slice_geometry(
+            self._slice_input, self._units
+        )
         request = self._make_slice_request_internal(
             slice_input=self._slice_input,
-            data_slice=self.data_slice,
+            data_slice=data_slice,
             dask_indexer=nullcontext,
+            canvas_grid=canvas_grid,
         )
         response = request()
         self._update_slice_response(response)
@@ -915,19 +923,74 @@ class ScalarFieldSlicingState(_LayerSlicingState):
         # absorbs these performance issues here, but we can likely improve
         # things either by caching the world-to-data transform on the layer
         # or by lazily evaluating it in the slice task itself.
-        data_slice = self._slice_indices(slice_input, dims)
+        data_slice, canvas_grid = self._resolve_slice_geometry(
+            slice_input, dims.units
+        )
         return self._make_slice_request_internal(
             slice_input=slice_input,
             data_slice=data_slice,
             dask_indexer=self.dask_optimized_slicing,
+            canvas_grid=canvas_grid,
+        )
+
+    def _resolve_slice_geometry(
+        self, slice_input: _SliceInput, units
+    ) -> tuple[_ThickNDSlice | _PlaneSlice, ObliqueCanvasGrid | None]:
+        """Computes the data-space slice geometry for `slice_input`.
+
+        For a 2D slice that is oblique (non-axis-aligned) through a solid
+        (shear-free) data_to_world transform, this returns a `_PlaneSlice`
+        plus the world-aligned grid it should be resampled onto.
+        Otherwise -- including for multiscale layers, out of caution about
+        multiscale level selection under an oblique plane, see the design
+        doc -- it falls back to the standard axis-aligned `_ThickNDSlice`,
+        which drops any out-of-slice rotation.
+        """
+        world_to_data = self.layer._data_to_world.inverse
+        world_to_data = apply_units_to_transform(world_to_data, units)
+
+        if (
+            not self.layer.multiscale
+            and slice_input.ndisplay == 2
+            and slice_input.is_solid(world_to_data)
+            and not slice_input.is_orthogonal(world_to_data)
+        ):
+            plane = slice_input.slice_plane(world_to_data)
+            canvas_grid = self._oblique_canvas_grid(slice_input)
+            return plane, canvas_grid
+
+        return slice_input.data_slice(world_to_data), None
+
+    def _oblique_canvas_grid(
+        self, slice_input: _SliceInput
+    ) -> ObliqueCanvasGrid:
+        """A world-axis-aligned sampling grid covering this layer's own extent along the displayed dims.
+
+        The step is the finest per-axis data_to_world scale, so the grid
+        never undersamples relative to the layer's native resolution;
+        this oversamples along coarser axes, a known v1 simplification
+        (see design doc -- a follow-up could pick a step per direction).
+        """
+        data_to_world = self.layer._data_to_world
+        world_extent = get_extent_world(
+            self.layer._extent_data_augmented, data_to_world
+        )
+        displayed = slice_input.displayed
+        world_origin = world_extent[0, displayed]
+        world_size = world_extent[1, displayed] - world_extent[0, displayed]
+        step = float(np.min(np.abs(data_to_world.scale))) or 1.0
+        shape = tuple(max(1, round(size / step)) for size in world_size)
+        return ObliqueCanvasGrid(
+            shape=shape, world_origin=world_origin, world_step=step
         )
 
     def _make_slice_request_internal(
         self,
         *,
         slice_input: _SliceInput,
-        data_slice: _ThickNDSlice,
+        data_slice: _ThickNDSlice | _PlaneSlice,
         dask_indexer: DaskIndexer,
+        canvas_grid: ObliqueCanvasGrid | None = None,
     ) -> _ScalarFieldSliceRequest:
         """Needed to support old-style sync slicing through _slice_dims and
         _set_view_slice.
@@ -983,6 +1046,7 @@ class ScalarFieldSlicingState(_LayerSlicingState):
             thumbnail_level=thumbnail_level,
             level_shapes=self.layer.level_shapes,
             downsample_factors=self.layer.downsample_factors,
+            canvas_grid=canvas_grid,
         )
 
     def _update_slice_response(

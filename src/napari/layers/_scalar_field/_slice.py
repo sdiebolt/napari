@@ -6,8 +6,17 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from napari.layers._scalar_field._oblique_slice import (
+    ObliqueCanvasGrid,
+    oblique_tile_to_data,
+    resample_oblique_plane,
+)
 from napari.layers.base._slice import _next_request_id
-from napari.layers.utils._slice_input import _SliceInput, _ThickNDSlice
+from napari.layers.utils._slice_input import (
+    _PlaneSlice,
+    _SliceInput,
+    _ThickNDSlice,
+)
 from napari.types import ArrayLike
 from napari.utils._dask_utils import DaskIndexer
 from napari.utils._dtype import normalize_dtype
@@ -209,7 +218,7 @@ class _ScalarFieldSliceRequest:
     data_at_thumbnail_level: Any = field(repr=False)
     dtype: DTypeLike = field(repr=False)
     dask_indexer: DaskIndexer
-    data_slice: _ThickNDSlice
+    data_slice: _ThickNDSlice | _PlaneSlice
     projection_mode: Any
     multiscale: bool = field(repr=False)
     corner_pixels: np.ndarray
@@ -219,8 +228,14 @@ class _ScalarFieldSliceRequest:
     level_shapes: np.ndarray = field(repr=False)
     downsample_factors: np.ndarray = field(repr=False)
     id: int = field(default_factory=_next_request_id)
+    # Only set when data_slice is a _PlaneSlice, i.e. an oblique 2D slice
+    # through a solid (shear-free) data_to_world transform.
+    canvas_grid: ObliqueCanvasGrid | None = field(default=None, repr=False)
 
     def __call__(self) -> _ScalarFieldSliceResponse:
+        if isinstance(self.data_slice, _PlaneSlice):
+            with self.dask_indexer():
+                return self._call_oblique_slice()
         if self._slice_out_of_bounds():
             return _ScalarFieldSliceResponse.make_empty(
                 slice_input=self.slice_input,
@@ -234,6 +249,43 @@ class _ScalarFieldSliceRequest:
                 if self.multiscale
                 else self._call_single_scale()
             )
+
+    def _call_oblique_slice(self) -> _ScalarFieldSliceResponse:
+        assert isinstance(self.data_slice, _PlaneSlice)
+        assert self.canvas_grid is not None
+        assert not self.multiscale, (
+            'oblique slicing of multiscale data is not yet supported'
+        )
+        # _PlaneSlice has no margin/thickness concept, so this is always a
+        # single-pixel-thin plane regardless of layer.projection_mode --
+        # thick oblique slicing is a separate future feature, not a mode
+        # we need to check for here.
+
+        data = resample_oblique_plane(
+            data=self.data_at_data_level,
+            plane=self.data_slice,
+            grid=self.canvas_grid,
+            order=self._resample_order(),
+            cval=0,
+        )
+        image = _ScalarFieldView.from_view(data)
+
+        tile_to_data = oblique_tile_to_data(
+            self.data_slice, self.canvas_grid, self.slice_input.ndim
+        )
+
+        return _ScalarFieldSliceResponse(
+            image=image,
+            thumbnail=image,
+            tile_to_data=tile_to_data,
+            slice_input=self.slice_input,
+            request_id=self.id,
+        )
+
+    @staticmethod
+    def _resample_order() -> int:
+        """The `scipy.ndimage.map_coordinates` interpolation order used to resample an oblique plane."""
+        return 1
 
     def _call_single_scale(self) -> _ScalarFieldSliceResponse:
         order = self._get_order()
