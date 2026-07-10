@@ -133,6 +133,50 @@ class _ThickNDSlice(Generic[_T]):
 
 
 @dataclass(frozen=True)
+class _PlaneSlice:
+    """An oblique (non-axis-aligned) data-space slicing plane.
+
+    Represents the affine map from canvas pixel coordinates (the layer's
+    displayed world dims, in world units) to full data-space coordinates::
+
+        data_coord = matrix @ canvas_coord + offset
+
+    This is the non-orthogonal counterpart of `_ThickNDSlice`: where
+    `_ThickNDSlice` can only represent an axis-aligned point and margins
+    per non-displayed dimension, `_PlaneSlice` represents an arbitrary
+    (solid, i.e. shear-free) plane through the data.
+
+    Attributes
+    ----------
+    matrix : (ndim, ndisplay) array
+        Maps a displayed-dim canvas coordinate to a data-space offset.
+    offset : (ndim,) array
+        The data-space coordinate at the canvas origin.
+    displayed : tuple of int
+        The layer dimension indices displayed in this slice, matching
+        `_SliceInput.displayed`.
+    not_displayed : tuple of int
+        The layer dimension indices not displayed in this slice, matching
+        `_SliceInput.not_displayed`.
+    """
+
+    matrix: npt.NDArray
+    offset: npt.NDArray
+    displayed: tuple[int, ...]
+    not_displayed: tuple[int, ...]
+
+    @property
+    def ndim(self) -> int:
+        """The dimensionality of the full data-space coordinates."""
+        return self.offset.shape[0]
+
+    def __call__(self, canvas_coords: npt.NDArray) -> npt.NDArray:
+        """Maps canvas coordinates with shape (..., ndisplay) to data coordinates with shape (..., ndim)."""
+        canvas_coords = np.asarray(canvas_coords)
+        return canvas_coords @ self.matrix.T + self.offset
+
+
+@dataclass(frozen=True)
 class _SliceInput:
     """Encapsulates the input needed for slicing a layer.
 
@@ -237,6 +281,56 @@ class _SliceInput:
         )
         # Check that displayed subspace is null
         return all(abs(v) < 1e-8 for v in displayed_mapped_subspace)
+
+    def is_solid(self, world_to_data: Affine) -> bool:
+        """Returns True if world_to_data is the inverse of a solid (shear-free) transform.
+
+        A solid transform is a composition of a rotation (or reflection),
+        an anisotropic per-axis scale, and a translation, with no shear --
+        i.e. a `layer.data_to_world` set only via `rotate`/`scale`/
+        `translate`. Every orthogonal slice (see `is_orthogonal`) is also
+        solid, since axis-aligned slicing only requires the non-displayed
+        subspace to map cleanly, whereas solid-ness is a property of the
+        whole transform.
+
+        Note this checks `world_to_data.inverse` (i.e. `data_to_world`),
+        not `world_to_data` itself: inverting a shear-free transform does
+        not generally stay shear-free when the scale is anisotropic,
+        because rotation and anisotropic scale don't commute.
+
+        Oblique (non-orthogonal) slicing through a solid transform can be
+        implemented by resampling along the plane spanned by the displayed
+        dims (see `slice_plane`), without needing to handle shear.
+        """
+        return bool(np.allclose(world_to_data.inverse.shear, 0, atol=1e-8))
+
+    def slice_plane(self, world_to_data: Affine) -> _PlaneSlice:
+        """Computes the data-space plane sampled by this oblique slice.
+
+        This should only be used when `is_solid(world_to_data)` is True.
+        It returns the affine map from canvas pixel coordinates (in the
+        displayed dims, in world units) to full data-space coordinates:
+
+            data_coord = matrix @ canvas_coord + offset
+
+        Unlike `data_slice`, this does not drop the out-of-slice rotation
+        component, so it can be used to correctly resample an oblique
+        (non-axis-aligned) slice through the data.
+        """
+        linear_matrix = world_to_data.linear_matrix
+        matrix = linear_matrix[:, self.displayed]
+
+        world_point = np.zeros(self.ndim)
+        for d in self.not_displayed:
+            world_point[d] = self.world_slice.point[d]
+        offset = linear_matrix @ world_point + world_to_data.translate
+
+        return _PlaneSlice(
+            matrix=matrix,
+            offset=offset,
+            displayed=tuple(self.displayed),
+            not_displayed=tuple(self.not_displayed),
+        )
 
 
 def apply_units_to_transform(
