@@ -88,6 +88,16 @@ class _ScalarFieldSliceResponse:
         Describes the slicing plane or bounding box in the layer's dimensions.
     request_id : int
         The identifier of the request from which this was generated.
+    oblique_canvas_grid : ObliqueCanvasGrid, optional
+        The world-aligned grid `image` was resampled onto, when `image` is
+        an oblique resample (see `_PlaneSlice`). `tile_to_data` maps this
+        tile's pixel-index space to data space via an arbitrary (rotated)
+        affine for oblique tiles, unlike the simple per-axis scale/translate
+        used for axis-aligned tiles -- so code that needs to reason about
+        this tile's own coordinate frame (e.g. the transform box overlay,
+        or vispy's pixel-center offset) can't derive it from the data
+        extent or from `data_to_world` the way it does for axis-aligned
+        tiles, and needs this instead. None for axis-aligned tiles.
     """
 
     image: _ScalarFieldView = field(repr=False)
@@ -96,6 +106,9 @@ class _ScalarFieldSliceResponse:
     slice_input: _SliceInput
     request_id: int
     empty: bool = False
+    oblique_canvas_grid: ObliqueCanvasGrid | None = field(
+        default=None, repr=False
+    )
 
     @classmethod
     def make_empty(
@@ -181,6 +194,7 @@ class _ScalarFieldSliceResponse:
             slice_input=self.slice_input,
             request_id=self.request_id,
             empty=self.empty,
+            oblique_canvas_grid=self.oblique_canvas_grid,
         )
 
 
@@ -280,6 +294,7 @@ class _ScalarFieldSliceRequest:
             tile_to_data=tile_to_data,
             slice_input=self.slice_input,
             request_id=self.id,
+            oblique_canvas_grid=self.canvas_grid,
         )
 
     @staticmethod

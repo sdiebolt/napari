@@ -57,9 +57,10 @@ def expected_value_and_mask(layer, out_shape, axis, point0=POINT0):
     world_to_data = layer._data_to_world.inverse
     plane = slice_input.slice_plane(world_to_data)
 
-    # Must match _oblique_canvas_grid, which uses the augmented (pixel-size
-    # inclusive) extent -- plain layer.extent.world is half a pixel off.
-    world_extent = layer._extent_augmented.world
+    # Must match _oblique_canvas_grid, which samples at pixel *centers*
+    # (the unaugmented extent) -- the augmented, pixel-edge extent is for
+    # drawing a box around the grid, not for the grid itself.
+    world_extent = layer.extent.world
     origin = world_extent[0, list(slice_input.displayed)]
     step = float(np.min(np.abs(layer._data_to_world.scale)))
 

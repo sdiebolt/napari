@@ -267,7 +267,19 @@ class VispyBaseLayer(ABC, Generic[_L]):
             offset_matrix = self.layer._data_to_world.set_slice(
                 dims_displayed
             ).linear_matrix
-            offset = -offset_matrix @ np.ones(offset_matrix.shape[1]) / 2
+            # For an oblique tile (see _PlaneSlice), tile pixels are a
+            # world-aligned grid with uniform spacing world_step -- they
+            # don't correspond to data pixels, so "half a pixel" can't be
+            # derived from data_to_world like it can for axis-aligned
+            # tiles; use the tile's own spacing instead.
+            last_slice = getattr(self.layer._slicing_state, '_slice', None)
+            canvas_grid = getattr(last_slice, 'oblique_canvas_grid', None)
+            if canvas_grid is not None:
+                offset = -np.full(
+                    offset_matrix.shape[1], canvas_grid.world_step / 2
+                )
+            else:
+                offset = -offset_matrix @ np.ones(offset_matrix.shape[1]) / 2
             # Convert NumPy axis ordering to VisPy axis ordering
             # and embed in full affine matrix
             affine_offset = np.eye(4)

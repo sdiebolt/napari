@@ -92,14 +92,64 @@ block reduces to exactly `diag(world_step)` — the rotation cancels out
 algebraically, it isn't just "not there". Implemented as
 `oblique_tile_to_data` in `_scalar_field/_oblique_slice.py`.
 
-Known follow-up nuance (not correctness-blocking): the existing
-half-pixel pixel-center offset in `_on_matrix_change`
-(`_vispy/layers/base.py:262-275`) computes its shift from
-`data_to_world.set_slice(displayed).linear_matrix`, which assumes tile
-pixel == data pixel. For an oblique tile that assumption doesn't hold
-(tile pixel spacing is `world_step`, not a data axis's pitch), so the
-half-pixel centering is likely slightly off for oblique tiles. Data
-placement itself is correct; this only affects sub-pixel centering.
+**Update:** the half-pixel nuance flagged above was real and got fixed
+(originally reported by a user testing the branch: after one rotation
+the transform-tool bounding box was wildly mispositioned and its edges
+couldn't be grabbed). Root causes, both from the same underlying
+assumption — "tile pixel == data pixel" — breaking for oblique tiles:
+
+1. **Overlay bounds.** `VispyTransformBoxOverlay`/`VispyBoundingBoxOverlay`
+   are parented directly under the layer's own vispy node
+   (`canvas.py:1095`), inheriting its `tile_to_data`-based local
+   transform — so overlay coordinates live in *tile-pixel-index* space,
+   not data space. They get their bounds from
+   `_display_bounding_box_augmented_data_level`, which returns the raw
+   *data* extent. For axis-aligned tiles tile-index == data-index (up to
+   a known scale/translate), so this always worked; for oblique tiles
+   `tile_to_data` is a rotated affine, so data-space bounds mean nothing
+   in tile-index space — the box was being drawn in the wrong coordinate
+   system entirely. Fixed by giving `_ScalarFieldSliceResponse` an
+   `oblique_canvas_grid` field and having
+   `_display_bounding_box_augmented_data_level` return tile-shape-based
+   bounds when it's set (`scalar_field.py`).
+2. **Pixel-center offset.** `_on_matrix_change`
+   (`_vispy/layers/base.py:262-275`) computes its half-pixel shift from
+   `data_to_world.set_slice(displayed).linear_matrix`, the same
+   tile-pixel == data-pixel assumption. Fixed with an oblique-aware
+   branch using `canvas_grid.world_step / 2` directly (uniform, since
+   oblique tile pixels are a world-aligned grid) instead of routing
+   through `data_to_world`.
+3. **Grid origin convention** (a separate bug found while fixing #1/#2,
+   in `_oblique_canvas_grid`): it used `_extent_data_augmented`
+   (pixel-edge extent, `[-0.5, shape - 0.5]`) as the sampling grid's
+   origin, but resample *samples* must land on pixel centers like every
+   other data source in napari — the augmented extent is a derived
+   quantity for drawing a box *around* a pixel-center grid, not the grid
+   itself. Every sample was off by half a pixel. Fixed by switching to
+   the unaugmented `_extent_data` (plus a `+1` in the sample-count
+   formula, since the unaugmented extent spans `shape - 1` steps between
+   `shape` samples).
+
+Verified end-to-end: a known bright blob placed at a specific data
+coordinate resamples to within 0.003 world units of its true rotated
+position (`test_oblique_slice.py`), and the bounding-box overlay's
+on-screen world extent matches a ground truth computed independently
+from `oblique_canvas_grid` to `atol=1e-6`
+(`test_vispy_bounding_box_visual.py::test_bounding_box_oblique_2D`).
+
+Note the overlay ground truth here is the *2D slice's own footprint*,
+not `layer.extent` (the full 3D data's world bounding box) — a
+cross-section through a rotated volume at a fixed point generally has a
+smaller/different footprint than the shadow of the whole volume. Mixing
+these up cost real debugging time; worth remembering for any future
+overlay work here.
+
+Separately (pre-existing, confirmed present even for a plain unrotated
+layer, **not** part of this issue): `VispyTransformBoxOverlay`'s corner
+handles sit a uniform 0.5 world units inside the augmented extent
+(e.g. `[-1, 29]` instead of `[-0.5, 29.5]` for a 30-cube). Small enough
+not to break interaction for axis-aligned data, which is presumably why
+it went unnoticed; out of scope here, worth its own issue.
 
 ## Where each piece lives
 
@@ -139,11 +189,14 @@ rewrite.
 2. Single-scale Image + Labels: wire `_call_oblique_slice` + bbox/resample
    module + `tile_to_data` derivation + Labels order=0 hook. (Labels rode
    along with this step since it was a one-line override once the
-   `_project_slice`-style hook pattern was in place.) **Done.**
+   `_project_slice`-style hook pattern was in place.) Also folded in,
+   after user testing surfaced it: fixing the transform-box/bounding-box
+   overlay positioning and the sampling-grid origin convention (see
+   "Update" note above). **Done.**
 3. Multiscale (pinned level, no smart picking).
 4. Thick-slice / projection-mode interaction.
 
-Steps 1–2 are the feasibility proof (~1–2 wk). 3–5 are incremental,
+Steps 1–2 are the feasibility proof (~1–2 wk). 3–4 are incremental,
 lower-risk given the seam above.
 
 ---

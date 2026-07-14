@@ -843,7 +843,19 @@ class ScalarFieldBase(Layer, ABC):
         """An augmented, axis-aligned (ndisplay, 2) bounding box.
         If the layer is multiscale layer, then returns the
         bounding box of the data at the current level
+
+        For an oblique tile (see `_PlaneSlice`), the data extent has no
+        simple relationship to the tile's own pixel-index space -- unlike
+        axis-aligned tiles, where tile index == data index up to a known
+        per-axis scale/translate, `tile_to_data` for an oblique tile is an
+        arbitrary (rotated) affine. Overlays that live in this layer's
+        tile coordinate frame (e.g. the transform box) need bounds in
+        that same frame, so we return the tile's own shape instead of the
+        data extent in that case.
         """
+        canvas_grid = self._slicing_state._slice.oblique_canvas_grid
+        if canvas_grid is not None:
+            return np.array([[-0.5, size - 0.5] for size in canvas_grid.shape])
         return self._extent_level_data_augmented[:, dims_displayed].T
 
     def _get_layer_slicing_state(
@@ -966,20 +978,27 @@ class ScalarFieldSlicingState(_LayerSlicingState):
     ) -> ObliqueCanvasGrid:
         """A world-axis-aligned sampling grid covering this layer's own extent along the displayed dims.
 
+        Uses the *un*augmented extent (pixel centers, e.g. [0, shape - 1])
+        rather than `_extent_data_augmented` (pixel edges, [-0.5, shape -
+        0.5]): samples must land on true pixel centers, matching how
+        every other data source in napari is indexed. The augmented,
+        pixel-edge extent is a derived quantity for drawing a box *around*
+        a pixel-center grid (see `_display_bounding_box_augmented_data_level`),
+        not the grid itself -- using it here would offset every sample by
+        half a pixel.
+
         The step is the finest per-axis data_to_world scale, so the grid
         never undersamples relative to the layer's native resolution;
         this oversamples along coarser axes, a known v1 simplification
         (see design doc -- a follow-up could pick a step per direction).
         """
         data_to_world = self.layer._data_to_world
-        world_extent = get_extent_world(
-            self.layer._extent_data_augmented, data_to_world
-        )
+        world_extent = get_extent_world(self.layer._extent_data, data_to_world)
         displayed = slice_input.displayed
         world_origin = world_extent[0, displayed]
         world_size = world_extent[1, displayed] - world_extent[0, displayed]
         step = float(np.min(np.abs(data_to_world.scale))) or 1.0
-        shape = tuple(max(1, round(size / step)) for size in world_size)
+        shape = tuple(max(1, round(size / step)) + 1 for size in world_size)
         return ObliqueCanvasGrid(
             shape=shape, world_origin=world_origin, world_step=step
         )
